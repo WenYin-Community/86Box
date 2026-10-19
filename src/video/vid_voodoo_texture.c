@@ -37,6 +37,7 @@
 #include <86box/vid_voodoo_regs.h>
 #include <86box/vid_voodoo_render.h>
 #include <86box/vid_voodoo_texture.h>
+#include <86box/vid_voodoo_texture_avx512.h>
 
 #ifdef ENABLE_VOODOO_TEXTURE_LOG
 int voodoo_texture_do_log = ENABLE_VOODOO_TEXTURE_LOG;
@@ -285,6 +286,119 @@ voodoo_recalc_tex3(voodoo_t *voodoo, int tmu)
 
 #define makergba(r, g, b, a) ((b) | ((g) << 8) | ((r) << 16) | ((a) << 24))
 
+#if defined(VOODOO_TEX_AVX512_ENABLED)
+/*
+ * Decode one whole mip level with 16-wide integer SIMD.
+ *
+ * Returns 0 when the format is not handled, when the level is narrower than
+ * one vector, or when the level would wrap around the end of texture memory.
+ * The caller then runs the scalar switch below unchanged, so the vector path
+ * never has to reproduce the masking edge cases.
+ */
+static int
+voodoo_tex_decode_avx512(voodoo_t *voodoo, voodoo_params_t *params, int tmu, int lod, int cache_index, uint32_t texture_mask)
+{
+    int             width      = voodoo->params.tex_w_mask[tmu][lod] + 1;
+    int             height     = voodoo->params.tex_h_mask[tmu][lod] + 1;
+    int             shift      = 8 - params->tex_lod[tmu][lod];
+    int             texel_size = (params->tformat[tmu] & 8) ? 2 : 1;
+    int             row_stride = 1 << (params->tex_shift[tmu][lod] + (texel_size - 1));
+    uint32_t        tex_addr   = params->tex_base[tmu][lod] & texture_mask;
+    uint32_t       *base       = &voodoo->texture_cache[tmu][cache_index].data[texture_offset[lod]];
+    const uint8_t  *src;
+    void          (*row8)(const uint8_t *, uint32_t *, int)                      = NULL;
+    void          (*row16)(const uint8_t *, uint32_t *, int)                     = NULL;
+    void          (*gather8)(const uint8_t *, uint32_t *, int, const uint32_t *) = NULL;
+    void          (*gather16)(const uint8_t *, uint32_t *, int, const uint32_t *) = NULL;
+    const uint32_t *table = NULL;
+    uint64_t        span;
+
+    /* Texture dimensions are powers of two, so any level at least one vector
+       wide needs no scalar tail; keep the check defensive anyway. */
+    if (width < 16 || (width & 15))
+        return 0;
+
+    /* The scalar loop masks every texel address; vector loads need the whole
+       level to be contiguous in texture memory. */
+    span = (uint64_t) tex_addr
+         + (uint64_t) (height - 1) * (uint64_t) row_stride
+         + (uint64_t) width * (uint64_t) texel_size;
+    if (span > (uint64_t) texture_mask + 1)
+        return 0;
+
+    switch (params->tformat[tmu]) {
+        case TEX_A8:
+            row8 = voodoo_tex_avx512_a8;
+            break;
+        case TEX_I8:
+            row8 = voodoo_tex_avx512_i8;
+            break;
+        case TEX_AI8:
+            row8 = voodoo_tex_avx512_ai8;
+            break;
+        case TEX_RGB332:
+            row8 = voodoo_tex_avx512_rgb332;
+            break;
+        case TEX_Y4I2Q2:
+            gather8 = voodoo_tex_avx512_y4i2q2;
+            table   = (const uint32_t *) voodoo->ncc_lookup[tmu][(voodoo->params.textureMode[tmu] & TEXTUREMODE_NCC_SEL) ? 1 : 0];
+            break;
+        case TEX_PAL8:
+            gather8 = voodoo_tex_avx512_pal8;
+            table   = (const uint32_t *) voodoo->palette[tmu];
+            break;
+        case TEX_APAL8:
+            gather8 = voodoo_tex_avx512_apal8;
+            table   = (const uint32_t *) voodoo->palette[tmu];
+            break;
+
+        case TEX_ARGB8332:
+            row16 = voodoo_tex_avx512_argb8332;
+            break;
+        case TEX_A8Y4I2Q2:
+            gather16 = voodoo_tex_avx512_a8y4i2q2;
+            table    = (const uint32_t *) voodoo->ncc_lookup[tmu][(voodoo->params.textureMode[tmu] & TEXTUREMODE_NCC_SEL) ? 1 : 0];
+            break;
+        case TEX_R5G6B5:
+            row16 = voodoo_tex_avx512_r5g6b5;
+            break;
+        case TEX_ARGB1555:
+            row16 = voodoo_tex_avx512_argb1555;
+            break;
+        case TEX_ARGB4444:
+            row16 = voodoo_tex_avx512_argb4444;
+            break;
+        case TEX_A8I8:
+            row16 = voodoo_tex_avx512_a8i8;
+            break;
+        case TEX_APAL88:
+            gather16 = voodoo_tex_avx512_apal88;
+            table    = (const uint32_t *) voodoo->palette[tmu];
+            break;
+
+        default:
+            return 0;
+    }
+
+    src = &voodoo->tex_mem[tmu][tex_addr];
+    for (int y = 0; y < height; y++) {
+        if (row8)
+            row8(src, base, width);
+        else if (row16)
+            row16(src, base, width);
+        else if (gather8)
+            gather8(src, base, width, table);
+        else
+            gather16(src, base, width, table);
+
+        src += row_stride;
+        base += 1 << shift;
+    }
+
+    return 1;
+}
+#endif
+
 void
 voodoo_use_texture(voodoo_t *voodoo, voodoo_params_t *params, int tmu)
 {
@@ -373,6 +487,13 @@ voodoo_use_texture(voodoo_t *voodoo, voodoo_params_t *params, int tmu)
 
 #if 0
         voodoo_texture_log("  LOD %i : %08x - %08x %i %i,%i\n", lod, params->tex_base[tmu][lod] & texture_mask, addr, voodoo->params.tformat[tmu], voodoo->params.tex_w_mask[tmu][lod],voodoo->params.tex_h_mask[tmu][lod]);
+#endif
+
+#if defined(VOODOO_TEX_AVX512_ENABLED)
+        /* 16-wide integer decode, bit-identical to the scalar switch below. */
+        if (voodoo_tex_avx512_available()
+            && voodoo_tex_decode_avx512(voodoo, params, tmu, lod, c, texture_mask))
+            continue;
 #endif
 
         switch (params->tformat[tmu]) {

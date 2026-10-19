@@ -48,5 +48,15 @@ if(BUILD_TESTING)
     )
     add_test(NAME Mach64.3D COMMAND mach64_3d_tests)
 
+    add_executable(voodoo_texture_tests vid_voodoo_texture_test.c)
+    target_compile_options(voodoo_texture_tests PRIVATE
+        $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-ffunction-sections;-fdata-sections>
+    )
+    target_link_options(voodoo_texture_tests PRIVATE
+        $<$<PLATFORM_ID:Darwin>:-Wl,-dead_strip>
+        $<$<AND:$<NOT:$<PLATFORM_ID:Darwin>>,$<C_COMPILER_ID:GNU,Clang>>:-Wl,--gc-sections>
+    )
+    add_test(NAME Voodoo.Texture COMMAND voodoo_texture_tests)
+
     add_subdirectory(rage128)
 endif()
